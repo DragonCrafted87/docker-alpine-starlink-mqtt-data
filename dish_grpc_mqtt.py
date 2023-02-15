@@ -12,9 +12,18 @@ Data will be published to the following topic names:
 : starlink/dish_usage/*id_value*/*field_name* : Usage history statistics
 
 Where *id_value* is the *id* value from the dish status information.
+
+Unless the --json command line option is used, in which case, JSON-formatted
+data will be published to topic name:
+
+: starlink/*id_value*
 """
 
+import json
 import logging
+import math
+import os
+import signal
 import sys
 import time
 
@@ -31,6 +40,15 @@ import dish_common
 HOST_DEFAULT = "localhost"
 
 
+class Terminated(Exception):
+    pass
+
+
+def handle_sigterm(signum, frame):
+    # Turn SIGTERM into an exception so main loop can clean up
+    raise Terminated
+
+
 def parse_args():
     parser = dish_common.create_arg_parser(output_description="publish it to a MQTT broker",
                                            bulk_history=False)
@@ -43,6 +61,7 @@ def parse_args():
     group.add_argument("-p", "--port", type=int, help="Port number to use on MQTT broker")
     group.add_argument("-P", "--password", help="Set password for username/password authentication")
     group.add_argument("-U", "--username", help="Set username for authentication")
+    group.add_argument("-J", "--json", action="store_true", help="Publish data as JSON")
     if ssl_ok:
 
         def wrap_ca_arg(arg):
@@ -69,6 +88,30 @@ def parse_args():
     else:
         parser.epilog += "\nSSL support options not available due to missing ssl module"
 
+    env_map = (
+        ("MQTT_HOST", "hostname"),
+        ("MQTT_PORT", "port"),
+        ("MQTT_USERNAME", "username"),
+        ("MQTT_PASSWORD", "password"),
+        ("MQTT_SSL", "tls"),
+    )
+    env_defaults = {}
+    for var, opt in env_map:
+        # check both set and not empty string
+        val = os.environ.get(var)
+        if val:
+            if var == "MQTT_SSL":
+                if ssl_ok and val != "false":
+                    if val == "insecure":
+                        env_defaults[opt] = {"cert_reqs": ssl.CERT_NONE}
+                    elif val == "secure":
+                        env_defaults[opt] = {}
+                    else:
+                        env_defaults[opt] = {"ca_certs": val}
+            else:
+                env_defaults[opt] = val
+    parser.set_defaults(**env_defaults)
+
     opts = dish_common.run_arg_parser(parser, need_id=True)
 
     if opts.username is None and opts.password is not None:
@@ -91,16 +134,38 @@ def parse_args():
 def loop_body(opts, gstate):
     msgs = []
 
-    def cb_add_item(key, val, category):
-        msgs.append(("starlink/dish_{0}/{1}/{2}".format(category, gstate.dish_id,
-                                                        key), val, 0, False))
+    if opts.json:
 
-    def cb_add_sequence(key, val, category, _):
-        msgs.append(
-            ("starlink/dish_{0}/{1}/{2}".format(category, gstate.dish_id,
-                                                key), ",".join(str(x) for x in val), 0, False))
+        data = {}
 
-    rc = dish_common.get_data(opts, gstate, cb_add_item, cb_add_sequence)
+        def cb_add_item(key, val, category):
+            if not "dish_{0}".format(category) in data:
+                data["dish_{0}".format(category)] = {}
+
+            # Skip NaN values that occur on startup because they can upset Javascript JSON parsers
+            if not (isinstance(val, float) and math.isnan(val)):
+                data["dish_{0}".format(category)].update({key: val})
+
+        def cb_add_sequence(key, val, category, _):
+            if not "dish_{0}".format(category) in data:
+                data["dish_{0}".format(category)] = {}
+
+            data["dish_{0}".format(category)].update({key: list(val)})
+
+    else:
+
+        def cb_add_item(key, val, category):
+            msgs.append(("starlink/dish_{0}/{1}/{2}".format(category, gstate.dish_id,
+                                                            key), val, 0, False))
+
+        def cb_add_sequence(key, val, category, _):
+            msgs.append(("starlink/dish_{0}/{1}/{2}".format(category, gstate.dish_id, key),
+                         ",".join("" if x is None else str(x) for x in val), 0, False))
+
+    rc = dish_common.get_data(opts, gstate, cb_add_item, cb_add_sequence)[0]
+
+    if opts.json:
+        msgs.append(("starlink/{0}".format(gstate.dish_id), json.dumps(data), 0, False))
 
     if msgs:
         try:
@@ -121,6 +186,9 @@ def main():
 
     gstate = dish_common.GlobalState(target=opts.target)
 
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    rc = 0
     try:
         next_loop = time.monotonic()
         while True:
@@ -131,11 +199,13 @@ def main():
                 time.sleep(next_loop - now)
             else:
                 break
+    except (KeyboardInterrupt, Terminated):
+        pass
     finally:
         gstate.shutdown()
 
     sys.exit(rc)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-"""Write Starlink user terminal data to an InfluxDB 1.x database.
+"""Write Starlink user terminal data to an InfluxDB 2.x database.
 
 This script pulls the current status info and/or metrics computed from the
-history data and writes them to the specified InfluxDB database either once
+history data and writes them to the specified InfluxDB 2.x database either once
 or in a periodic loop.
 
 Data will be written into the requested database with the following
@@ -29,12 +29,12 @@ import sys
 import time
 import warnings
 
-from influxdb import InfluxDBClient
+from influxdb_client import InfluxDBClient, WriteOptions, WritePrecision
 
 import dish_common
 
-HOST_DEFAULT = "localhost"
-DATABASE_DEFAULT = "starlinkstats"
+URL_DEFAULT = "http://localhost:8086"
+BUCKET_DEFAULT = "starlinkstats"
 BULK_MEASUREMENT = "spacex.starlink.user_terminal.history"
 FLUSH_LIMIT = 6
 MAX_BATCH = 5000
@@ -52,49 +52,40 @@ def handle_sigterm(signum, frame):
 
 def parse_args():
     parser = dish_common.create_arg_parser(
-        output_description="write it to an InfluxDB 1.x database")
+        output_description="write it to an InfluxDB 2.x database")
 
-    group = parser.add_argument_group(title="InfluxDB 1.x database options")
-    group.add_argument("-n",
-                       "--hostname",
-                       default=HOST_DEFAULT,
-                       dest="host",
-                       help="Hostname of InfluxDB server, default: " + HOST_DEFAULT)
-    group.add_argument("-p", "--port", type=int, help="Port number to use on InfluxDB server")
-    group.add_argument("-P", "--password", help="Set password for username/password authentication")
-    group.add_argument("-U", "--username", help="Set username for authentication")
-    group.add_argument("-D",
-                       "--database",
-                       default=DATABASE_DEFAULT,
-                       help="Database name to use, default: " + DATABASE_DEFAULT)
-    group.add_argument("-R", "--retention-policy", help="Retention policy name to use")
+    group = parser.add_argument_group(title="InfluxDB 2.x database options")
+    group.add_argument("-u",
+                       "--url",
+                       default=URL_DEFAULT,
+                       dest="url",
+                       help="URL of the InfluxDB 2.x server, default: " + URL_DEFAULT)
+    group.add_argument("-T", "--token", help="Token to access the bucket")
+    group.add_argument("-B",
+                       "--bucket",
+                       default=BUCKET_DEFAULT,
+                       help="Bucket name to use, default: " + BUCKET_DEFAULT)
+    group.add_argument("-O", "--org", help="Organisation name")
     group.add_argument("-k",
                        "--skip-query",
                        action="store_true",
                        help="Skip querying for prior sample write point in bulk mode")
     group.add_argument("-C",
                        "--ca-cert",
-                       dest="verify_ssl",
-                       help="Enable SSL/TLS using specified CA cert to verify server",
+                       dest="ssl_ca_cert",
+                       help="Use specified CA cert to verify HTTPS server",
                        metavar="FILENAME")
     group.add_argument("-I",
                        "--insecure",
                        action="store_false",
                        dest="verify_ssl",
-                       help="Enable SSL/TLS but disable certificate verification (INSECURE!)")
-    group.add_argument("-S",
-                       "--secure",
-                       action="store_true",
-                       dest="verify_ssl",
-                       help="Enable SSL/TLS using default CA cert")
+                       help="Disable certificate verification of HTTPS server (INSECURE!)")
 
     env_map = (
-        ("INFLUXDB_HOST", "host"),
-        ("INFLUXDB_PORT", "port"),
-        ("INFLUXDB_USER", "username"),
-        ("INFLUXDB_PWD", "password"),
-        ("INFLUXDB_DB", "database"),
-        ("INFLUXDB_RP", "retention-policy"),
+        ("INFLUXDB_URL", "url"),
+        ("INFLUXDB_TOKEN", "token"),
+        ("INFLUXDB_Bucket", "bucket"),
+        ("INFLUXDB_ORG", "org"),
         ("INFLUXDB_SSL", "verify_ssl"),
     )
     env_defaults = {}
@@ -102,47 +93,59 @@ def parse_args():
         # check both set and not empty string
         val = os.environ.get(var)
         if val:
-            if var == "INFLUXDB_SSL" and val == "secure":
-                env_defaults[opt] = True
-            elif var == "INFLUXDB_SSL" and val == "insecure":
-                env_defaults[opt] = False
+            if var == "INFLUXDB_SSL":
+                if val == "insecure":
+                    env_defaults[opt] = False
+                elif val == "secure":
+                    env_defaults[opt] = True
+                else:
+                    env_defaults["ssl_ca_cert"] = val
             else:
                 env_defaults[opt] = val
     parser.set_defaults(**env_defaults)
 
     opts = dish_common.run_arg_parser(parser, need_id=True)
 
-    if opts.username is None and opts.password is not None:
-        parser.error("Password authentication requires username to be set")
-
-    opts.icargs = {"timeout": 5}
-    for key in ["port", "host", "password", "username", "database", "verify_ssl"]:
+    opts.icargs = {}
+    for key in ["url", "token", "bucket", "org", "verify_ssl", "ssl_ca_cert"]:
         val = getattr(opts, key)
         if val is not None:
             opts.icargs[key] = val
 
-    if opts.verify_ssl is not None:
-        opts.icargs["ssl"] = True
+    if (not opts.verify_ssl
+            or opts.ssl_ca_cert is not None) and not opts.url.lower().startswith("https:"):
+        parser.error("SSL options only apply to HTTPS URLs")
 
     return opts
 
 
 def flush_points(opts, gstate):
     try:
+        write_api = gstate.influx_client.write_api(
+            write_options=WriteOptions(batch_size=len(gstate.points),
+                                       flush_interval=10_000,
+                                       jitter_interval=2_000,
+                                       retry_interval=5_000,
+                                       max_retries=5,
+                                       max_retry_delay=30_000,
+                                       exponential_base=2))
         while len(gstate.points) > MAX_BATCH:
-            gstate.influx_client.write_points(gstate.points[:MAX_BATCH],
-                                              time_precision="s",
-                                              retention_policy=opts.retention_policy)
+            write_api.write(record=gstate.points[:MAX_BATCH],
+                            write_precision=WritePrecision.S,
+                            bucket=opts.bucket)
             if opts.verbose:
                 print("Data points written: " + str(MAX_BATCH))
             del gstate.points[:MAX_BATCH]
+
         if gstate.points:
-            gstate.influx_client.write_points(gstate.points,
-                                              time_precision="s",
-                                              retention_policy=opts.retention_policy)
+            write_api.write(record=gstate.points,
+                            write_precision=WritePrecision.S,
+                            bucket=opts.bucket)
             if opts.verbose:
                 print("Data points written: " + str(len(gstate.points)))
             gstate.points.clear()
+        write_api.flush()
+        write_api.close()
     except Exception as e:
         dish_common.conn_error(opts, "Failed writing to InfluxDB database: %s", str(e))
         # If failures persist, don't just use infinite memory. Max queue
@@ -156,35 +159,29 @@ def flush_points(opts, gstate):
     return 0
 
 
-def query_counter(gstate, start, end):
-    try:
-        # fetch the latest point where counter field was recorded
-        result = gstate.influx_client.query("SELECT counter FROM \"{0}\" "
-                                            "WHERE time>={1}s AND time<{2}s AND id=$id "
-                                            "ORDER by time DESC LIMIT 1;".format(
-                                                BULK_MEASUREMENT, start, end),
-                                            bind_params={"id": gstate.dish_id},
-                                            epoch="s")
-        points = list(result.get_points())
-        if points:
-            counter = points[0].get("counter", None)
-            timestamp = points[0].get("time", 0)
-            if counter and timestamp:
-                return int(counter), int(timestamp)
-    except TypeError as e:
-        # bind_params was added in influxdb-python v5.2.3. That would be easy
-        # enough to work around, but older versions had other problems with
-        # query(), so just skip this functionality.
-        logging.error(
-            "Failed running query, probably due to influxdb-python version too old. "
-            "Skipping resumption from prior counter value. Reported error was: %s", str(e))
+def query_counter(opts, gstate, start, end):
+    query_api = gstate.influx_client.query_api()
+    result = query_api.query('''
+    from(bucket: "{0}")
+        |> range(start: {1}, stop: {2})
+        |> filter(fn: (r) => r["_measurement"] == "{3}")
+        |> filter(fn: (r) => r["_field"] == "counter")
+        |> last()
+        |> yield(name: "last")
+        '''.format(opts.bucket, str(start), str(end), BULK_MEASUREMENT))
+    if result:
+        counter = result[0].records[0]["_value"]
+        timestamp = result[0].records[0]["_time"].timestamp()
+        if counter and timestamp:
+            return int(counter), int(timestamp)
 
     return None, 0
 
 
 def sync_timebase(opts, gstate):
     try:
-        db_counter, db_timestamp = query_counter(gstate, gstate.start_timestamp, gstate.timestamp)
+        db_counter, db_timestamp = query_counter(opts, gstate, gstate.start_timestamp,
+                                                 gstate.timestamp)
     except Exception as e:
         # could be temporary outage, so try again next time
         dish_common.conn_error(opts, "Failed querying InfluxDB for prior count: %s", str(e))
@@ -304,12 +301,7 @@ def main():
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
     signal.signal(signal.SIGTERM, handle_sigterm)
-    try:
-        # attempt to hack around breakage between influxdb-python client and 2.0 server:
-        gstate.influx_client = InfluxDBClient(**opts.icargs, headers={"Accept": "application/json"})
-    except TypeError:
-        # ...unless influxdb-python package version is too old
-        gstate.influx_client = InfluxDBClient(**opts.icargs)
+    gstate.influx_client = InfluxDBClient(**opts.icargs)
 
     rc = 0
     try:

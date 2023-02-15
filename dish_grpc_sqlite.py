@@ -46,7 +46,7 @@ import time
 import dish_common
 import starlink_grpc
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 class Terminated(Exception):
@@ -72,7 +72,7 @@ def parse_args():
     group.add_argument("-k",
                        "--skip-query",
                        action="store_true",
-                       help="Skip querying for prior sample write point in bulk mode")
+                       help="Skip querying for prior sample write point in history modes")
 
     opts = dish_common.run_arg_parser(parser, need_id=True)
 
@@ -99,7 +99,7 @@ def query_counter(opts, gstate, column, table):
         return 0, None
 
 
-def loop_body(opts, gstate):
+def loop_body(opts, gstate, shutdown=False):
     tables = {"status": {}, "ping_stats": {}, "usage": {}}
     hist_cols = ["time", "id"]
     hist_rows = []
@@ -122,15 +122,22 @@ def loop_body(opts, gstate):
             row.append(counter)
             hist_rows.append(row)
 
-    now = int(time.time())
-    rc = dish_common.get_status_data(opts, gstate, cb_add_item, cb_add_sequence)
+    rc = 0
+    status_ts = None
+    hist_ts = None
 
-    if opts.history_stats_mode and not rc:
+    if not shutdown:
+        rc, status_ts = dish_common.get_status_data(opts, gstate, cb_add_item, cb_add_sequence)
+
+    if opts.history_stats_mode and (not rc or opts.poll_loops > 1):
         if gstate.counter_stats is None and not opts.skip_query and opts.samples < 0:
             _, gstate.counter_stats = query_counter(opts, gstate, "end_counter", "ping_stats")
-        rc = dish_common.get_history_stats(opts, gstate, cb_add_item, cb_add_sequence)
+        hist_rc, hist_ts = dish_common.get_history_stats(opts, gstate, cb_add_item, cb_add_sequence,
+                                                         shutdown)
+        if not rc:
+            rc = hist_rc
 
-    if opts.bulk_mode and not rc:
+    if not shutdown and opts.bulk_mode and not rc:
         if gstate.counter is None and not opts.skip_query and opts.bulk_samples < 0:
             gstate.timestamp, gstate.counter = query_counter(opts, gstate, "counter", "history")
         rc = dish_common.get_bulk_data(opts, gstate, cb_add_bulk)
@@ -141,11 +148,12 @@ def loop_body(opts, gstate):
         cur = gstate.sql_conn.cursor()
         for category, fields in tables.items():
             if fields:
+                timestamp = status_ts if category == "status" else hist_ts
                 sql = 'INSERT OR REPLACE INTO "{0}" ("time","id",{1}) VALUES ({2})'.format(
                     category, ",".join('"' + x + '"' for x in fields),
                     ",".join(repeat("?",
                                     len(fields) + 2)))
-                values = [now, gstate.dish_id]
+                values = [timestamp, gstate.dish_id]
                 values.extend(fields.values())
                 cur.execute(sql, values)
                 rows_written += 1
@@ -200,8 +208,10 @@ def ensure_schema(opts, conn, context):
 
 def create_tables(conn, context, suffix):
     tables = {}
-    name_groups = starlink_grpc.status_field_names(context=context)
-    type_groups = starlink_grpc.status_field_types(context=context)
+    name_groups = (starlink_grpc.status_field_names(context=context) +
+                   (starlink_grpc.location_field_names(),))
+    type_groups = (starlink_grpc.status_field_types(context=context) +
+                   (starlink_grpc.location_field_types(),))
     tables["status"] = zip(name_groups, type_groups)
 
     name_groups = starlink_grpc.history_stats_field_names()
@@ -260,7 +270,7 @@ def convert_tables(conn, context):
             ",".join(repeat("?", len(new_columns))))
         new_cur.executemany(sql, (tuple(row[col] for col in new_columns) for row in old_cur))
         new_cur.execute('DROP TABLE "{0}"'.format(table))
-        new_cur.execute('ALTER TABLE {0}_new RENAME TO {0}'.format(table))
+        new_cur.execute('ALTER TABLE "{0}_new" RENAME TO "{0}"'.format(table))
     old_cur.close()
     new_cur.close()
     conn.row_factory = None
@@ -295,14 +305,15 @@ def main():
     except sqlite3.Error as e:
         logging.error("Database error: %s", e)
         rc = 1
-    except Terminated:
+    except (KeyboardInterrupt, Terminated):
         pass
     finally:
+        loop_body(opts, gstate, shutdown=True)
         gstate.sql_conn.close()
         gstate.shutdown()
 
     sys.exit(rc)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
