@@ -88,15 +88,20 @@ python3 dish_obstruction_map.py -t 3600 obstructions_%s.png
 
 Run it with the `-h` command line option for full usage details, including control of the map colors and color modes.
 
-#### Reboot and stow control
+#### Reboot, stow, and sleep control
 
-`dish_control.sh` is a simple stand alone script that can issue reboot, stow, or unstow commands to the dish:
+`dish_control.py` is a simple stand alone script that can issue reboot, stow, or unstow commands to the dish:
 ```shell script
 python3 dish_control.py reboot
 python3 dish_control.py stow
 python3 dish_control.py unstow
 ```
 These operations can also be done using `grpcurl`, thus avoiding the need to use Python or install the required Python module dependencies. See [here](https://github.com/sparky8512/starlink-grpc-tools/wiki/Useful-grpcurl-commands) for specific `grpcurl` commands for these operations.
+
+`dish_control.py` can also show, set, or disable the sleep mode schedule. You can get usage instructions for that by doing:
+```shell script
+python3 dish_control.py set_sleep -h
+```
 
 ### The JSON parser script
 
@@ -141,17 +146,17 @@ This will pull the image tagged as "latest". There should also be images for all
 
 You can run it with the following:
 ```shell script
-docker run --name='starlink-grpc-tools' ghcr.io/sparky8512/starlink-grpc-tools <script_name>.py <script args...>
+docker run --name=starlink-grpc-tools ghcr.io/sparky8512/starlink-grpc-tools <script_name>.py <script args...>
 ```
 For example, the following will print current status info and then exit:
 ```shell script
-docker run --name='starlink-grpc-tools' ghcr.io/sparky8512/starlink-grpc-tools dish_grpc_text.py -v status alert_detail
+docker run --name=starlink-grpc-tools ghcr.io/sparky8512/starlink-grpc-tools dish_grpc_text.py -v status alert_detail
 ```
 Of course, you can change the name to whatever you want instead, and use other docker run options, as appropriate.
 
-The default command is `dish_grpc_influx.py status alert_detail`, which is really only useful if you pass in environment variables with user and database info, such as:
+The default command is `dish_grpc_influx.py status alert_detail`, which is only useful if you have an InfluxDB server running somewhere and pass in environment variables with the appropriate user and database info, such as:
 ```shell script
-docker run --name='starlink-grpc-tools' -e INFLUXDB_HOST={InfluxDB Hostname} \
+docker run --name=starlink-grpc-tools -e INFLUXDB_HOST={InfluxDB Hostname} \
     -e INFLUXDB_PORT={Port, 8086 usually} \
     -e INFLUXDB_USER={Optional, InfluxDB Username} \
     -e INFLUXDB_PWD={Optional, InfluxDB Password} \
@@ -161,7 +166,7 @@ docker run --name='starlink-grpc-tools' -e INFLUXDB_HOST={InfluxDB Hostname} \
 
 When running in the background, you will probably want to specify a `-t` script option, to run in a loop, otherwise it will exit right away and leave an inactive container. For example:
 ```shell script
-docker run -d -t --name='starlink-grpc-tools' -e INFLUXDB_HOST={InfluxDB Hostname} \
+docker run -d -t --name=starlink-grpc-tools -e INFLUXDB_HOST={InfluxDB Hostname} \
     -e INFLUXDB_PORT={Port, 8086 usually} \
     -e INFLUXDB_USER={Optional, InfluxDB Username} \
     -e INFLUXDB_PWD={Optional, InfluxDB Password} \
@@ -198,7 +203,7 @@ sudo systemctl start starlink-influx2
 
 Several users have built dashboards for displaying data collected by the scripts in this project. Information on those can be found in [this Wiki article](https://github.com/sparky8512/starlink-grpc-tools/wiki/Dashboards). If you have one you would like to add, please feel free to edit the Wiki page to do so.
 
-Note that feeding a dashboard will likely need the `-t` script option to `dish_grpc_influx.py` in order to collect status and/or history information periodically.
+Note that feeding an InfluxDB dashboard will likely need the `-t` script option to `dish_grpc_influx.py` in order to collect status and/or history information periodically.
 
 ## To Be Done (Maybe, but Probably Not)
 
